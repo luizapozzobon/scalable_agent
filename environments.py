@@ -24,82 +24,31 @@ import os.path
 import numpy as np
 import tensorflow as tf
 
-import deepmind_lab
+import gym
+
+import atari_wrappers
 
 
 nest = tf.contrib.framework.nest
 
 
-class LocalLevelCache(object):
-  """Local level cache."""
+class PyProcessGym(object):
+  def __init__(self, env_name, seed):
+    self._env = None
+    self._create_gym_env(env_name)
+    self._env.seed(seed)
 
-  def __init__(self, cache_dir='/tmp/level_cache'):
-    self._cache_dir = cache_dir
-    tf.gfile.MakeDirs(cache_dir)
-
-  def fetch(self, key, pk3_path):
-    path = os.path.join(self._cache_dir, key)
-    if tf.gfile.Exists(path):
-      tf.gfile.Copy(path, pk3_path, overwrite=True)
-      return True
-    return False
-
-  def write(self, key, pk3_path):
-    path = os.path.join(self._cache_dir, key)
-    if not tf.gfile.Exists(path):
-      tf.gfile.Copy(pk3_path, path)
-
-
-DEFAULT_ACTION_SET = (
-    (0, 0, 0, 1, 0, 0, 0),    # Forward
-    (0, 0, 0, -1, 0, 0, 0),   # Backward
-    (0, 0, -1, 0, 0, 0, 0),   # Strafe Left
-    (0, 0, 1, 0, 0, 0, 0),    # Strafe Right
-    (-20, 0, 0, 0, 0, 0, 0),  # Look Left
-    (20, 0, 0, 0, 0, 0, 0),   # Look Right
-    (-20, 0, 0, 1, 0, 0, 0),  # Look Left + Forward
-    (20, 0, 0, 1, 0, 0, 0),   # Look Right + Forward
-    (0, 0, 0, 0, 1, 0, 0),    # Fire.
-)
-
-
-class PyProcessDmLab(object):
-  """DeepMind Lab wrapper for PyProcess."""
-
-  def __init__(self, level, config, num_action_repeats, seed,
-               runfiles_path=None, level_cache=None):
-    self._num_action_repeats = num_action_repeats
-    self._random_state = np.random.RandomState(seed=seed)
-    if runfiles_path:
-      deepmind_lab.set_runfiles_path(runfiles_path)
-    config = {k: str(v) for k, v in config.iteritems()}
-    self._observation_spec = ['RGB_INTERLEAVED', 'INSTR']
-    self._env = deepmind_lab.Lab(
-        level=level,
-        observations=self._observation_spec,
-        config=config,
-        level_cache=level_cache,
-    )
-
-  def _reset(self):
-    self._env.reset(seed=self._random_state.randint(0, 2 ** 31 - 1))
-
-  def _observation(self):
-    d = self._env.observations()
-    return [d[k] for k in self._observation_spec]
+  def _create_gym_env(self, env_name):
+    self._env = gym.make(env_name)
 
   def initial(self):
-    self._reset()
-    return self._observation()
+    return [self._env.reset()]
 
   def step(self, action):
-    reward = self._env.step(action, num_steps=self._num_action_repeats)
-    done = np.array(not self._env.is_running())
+    frame, reward, done, unused_info = self._env.step(action)
     if done:
-      self._reset()
-    observation = self._observation()
-    reward = np.array(reward, dtype=np.float32)
-    return reward, done, observation
+      frame = self._env.reset()
+    return np.array(reward, dtype=np.float32), np.array(done), [frame]
 
   def close(self):
     self._env.close()
@@ -107,12 +56,11 @@ class PyProcessDmLab(object):
   @staticmethod
   def _tensor_specs(method_name, unused_kwargs, constructor_kwargs):
     """Returns a nest of `TensorSpec` with the method's output specification."""
-    width = constructor_kwargs['config'].get('width', 320)
-    height = constructor_kwargs['config'].get('height', 240)
+    width = 84
+    height = 84
 
     observation_spec = [
-        tf.contrib.framework.TensorSpec([height, width, 3], tf.uint8),
-        tf.contrib.framework.TensorSpec([], tf.string),
+      tf.contrib.framework.TensorSpec([width, height, 4], tf.uint8),
     ]
 
     if method_name == 'initial':
@@ -123,6 +71,16 @@ class PyProcessDmLab(object):
           tf.contrib.framework.TensorSpec([], tf.bool),
           observation_spec,
       )
+
+
+class PyProcessAtari(PyProcessGym):
+  def _create_gym_env(self, env_name):
+    self._env = atari_wrappers.wrap_deepmind(
+      atari_wrappers.make_atari(env_name),
+      clip_rewards=False,
+      frame_stack=True,
+      scale=False,
+    )
 
 
 StepOutputInfo = collections.namedtuple('StepOutputInfo',

@@ -23,6 +23,7 @@ import contextlib
 import functools
 import os
 import sys
+import time
 
 import dmlab30
 import environments
@@ -65,6 +66,9 @@ flags.DEFINE_integer('unroll_length', 100, 'Unroll length in agent steps.')
 flags.DEFINE_integer('num_action_repeats', 4, 'Number of action repeats.')
 flags.DEFINE_integer('seed', 1, 'Random seed.')
 
+flags.DEFINE_integer('num_actions', 6, 'Number of actions.')
+flags.DEFINE_bool('use_lstm', False, 'Use LSTM in model.')
+
 # Loss settings.
 flags.DEFINE_float('entropy_cost', 0.00025, 'Entropy cost/multiplier.')
 flags.DEFINE_float('baseline_cost', .5, 'Baseline cost/multiplier.')
@@ -77,17 +81,16 @@ flags.DEFINE_string(
     'dataset_path', '',
     'Path to dataset needed for psychlab_*, see '
     'https://github.com/deepmind/lab/tree/master/data/brady_konkle_oliva2008')
-flags.DEFINE_string('level_name', 'explore_goal_locations_small',
-                    '''Level name or \'dmlab30\' for the full DmLab-30 suite '''
-                    '''with levels assigned round robin to the actors.''')
-flags.DEFINE_integer('width', 96, 'Width of observation.')
-flags.DEFINE_integer('height', 72, 'Height of observation.')
+flags.DEFINE_string('level_name', 'PongNoFrameskip-v4',
+                    'Name of OpenAI gym task.')
 
 # Optimizer settings.
 flags.DEFINE_float('learning_rate', 0.00048, 'Learning rate.')
 flags.DEFINE_float('decay', .99, 'RMSProp optimizer decay.')
 flags.DEFINE_float('momentum', 0., 'RMSProp momentum.')
 flags.DEFINE_float('epsilon', .1, 'RMSProp epsilon.')
+
+flags.DEFINE_float('grad_norm_clipping', 40.0, 'Global gradient norm clip.')
 
 
 # Structure to be sent from actors to learner.
@@ -110,39 +113,17 @@ class Agent(snt.RNNCore):
     self._num_actions = num_actions
 
     with self._enter_variable_scope():
-      self._core = tf.contrib.rnn.LSTMBlockCell(256)
+      if FLAGS.use_lstm:
+        self._core = tf.contrib.rnn.LSTMBlockCell(256)
 
   def initial_state(self, batch_size):
-    return self._core.zero_state(batch_size, tf.float32)
-
-  def _instruction(self, instruction):
-    # Split string.
-    splitted = tf.string_split(instruction)
-    dense = tf.sparse_tensor_to_dense(splitted, default_value='')
-    length = tf.reduce_sum(tf.to_int32(tf.not_equal(dense, '')), axis=1)
-
-    # To int64 hash buckets. Small risk of having collisions. Alternatively, a
-    # vocabulary can be used.
-    num_hash_buckets = 1000
-    buckets = tf.string_to_hash_bucket_fast(dense, num_hash_buckets)
-
-    # Embed the instruction. Embedding size 20 seems to be enough.
-    embedding_size = 20
-    embedding = snt.Embed(num_hash_buckets, embedding_size)(buckets)
-
-    # Pad to make sure there is at least one output.
-    padding = tf.to_int32(tf.equal(tf.shape(embedding)[1], 0))
-    embedding = tf.pad(embedding, [[0, 0], [0, padding], [0, 0]])
-
-    core = tf.contrib.rnn.LSTMBlockCell(64, name='language_lstm')
-    output, _ = tf.nn.dynamic_rnn(core, embedding, length, dtype=tf.float32)
-
-    # Return last output.
-    return tf.reverse_sequence(output, length, seq_axis=1)[:, 0]
+    if FLAGS.use_lstm:
+      return self._core.zero_state(batch_size, tf.float32)
+    return ()
 
   def _torso(self, input_):
     last_action, env_output = input_
-    reward, _, _, (frame, instruction) = env_output
+    reward, _, _, (frame,) = env_output
 
     # Convert to floats.
     frame = tf.to_float(frame)
@@ -176,13 +157,13 @@ class Agent(snt.RNNCore):
     conv_out = snt.Linear(256)(conv_out)
     conv_out = tf.nn.relu(conv_out)
 
-    instruction_out = self._instruction(instruction)
-
     # Append clipped last reward and one hot last action.
     clipped_reward = tf.expand_dims(tf.clip_by_value(reward, -1, 1), -1)
-    one_hot_last_action = tf.one_hot(last_action, self._num_actions)
     return tf.concat(
-        [conv_out, clipped_reward, one_hot_last_action, instruction_out],
+        [
+          conv_out,
+          clipped_reward,
+        ],
         axis=1)
 
   def _head(self, core_output):
@@ -209,6 +190,9 @@ class Agent(snt.RNNCore):
     _, _, done, _ = env_outputs
 
     torso_outputs = snt.BatchApply(self._torso)((actions, env_outputs))
+
+    if not FLAGS.use_lstm:
+      return snt.BatchApply(self._head)(torso_outputs), core_state
 
     # Note, in this implementation we can't use CuDNN RNN to speed things up due
     # to the state reset. This can be XLA-compiled (LSTMBlockCell needs to be
@@ -386,13 +370,15 @@ def build_learner(agent, agent_state, env_outputs, agent_outputs):
 
   # Compute loss as a weighted sum of the baseline loss, the policy gradient
   # loss and an entropy regularization term.
-  total_loss = compute_policy_gradient_loss(
+  pg_loss = compute_policy_gradient_loss(
       learner_outputs.policy_logits, agent_outputs.action,
       vtrace_returns.pg_advantages)
-  total_loss += FLAGS.baseline_cost * compute_baseline_loss(
-      vtrace_returns.vs - learner_outputs.baseline)
-  total_loss += FLAGS.entropy_cost * compute_entropy_loss(
-      learner_outputs.policy_logits)
+  baseline_loss = FLAGS.baseline_cost * compute_baseline_loss(
+    vtrace_returns.vs - learner_outputs.baseline)
+  entropy_loss = FLAGS.entropy_cost * compute_entropy_loss(
+    learner_outputs.policy_logits)
+
+  total_loss = pg_loss + baseline_loss + entropy_loss
 
   # Optimization
   num_env_frames = tf.train.get_global_step()
@@ -400,7 +386,10 @@ def build_learner(agent, agent_state, env_outputs, agent_outputs):
                                             FLAGS.total_environment_frames, 0)
   optimizer = tf.train.RMSPropOptimizer(learning_rate, FLAGS.decay,
                                         FLAGS.momentum, FLAGS.epsilon)
-  train_op = optimizer.minimize(total_loss)
+
+  gradients, variables = zip(*optimizer.compute_gradients(total_loss))
+  gradients, _ = tf.clip_by_global_norm(gradients, FLAGS.grad_norm_clipping)
+  train_op = optimizer.apply_gradients(zip(gradients, variables))
 
   # Merge updating the network and environment frames into a single tensor.
   with tf.control_dependencies([train_op]):
@@ -417,25 +406,7 @@ def build_learner(agent, agent_state, env_outputs, agent_outputs):
 
 def create_environment(level_name, seed, is_test=False):
   """Creates an environment wrapped in a `FlowEnvironment`."""
-  if level_name in dmlab30.ALL_LEVELS:
-    level_name = 'contributed/dmlab30/' + level_name
-
-  # Note, you may want to use a level cache to speed of compilation of
-  # environment maps. See the documentation for the Python interface of DeepMind
-  # Lab.
-  config = {
-      'width': FLAGS.width,
-      'height': FLAGS.height,
-      'datasetPath': FLAGS.dataset_path,
-      'logLevel': 'WARN',
-  }
-  if is_test:
-    config['allowHoldOutLevels'] = 'true'
-    # Mixer seed for evalution, see
-    # https://github.com/deepmind/lab/blob/master/docs/users/python_api.md
-    config['mixerSeed'] = 0x600D5EED
-  p = py_process.PyProcess(environments.PyProcessDmLab, level_name, config,
-                           FLAGS.num_action_repeats, seed)
+  p = py_process.PyProcess(environments.PyProcessAtari, FLAGS.level_name, seed)
   return environments.FlowEnvironment(p.proxy)
 
 
@@ -460,6 +431,7 @@ def train(action_set, level_names):
   """Train."""
 
   if is_single_machine():
+    tf.logging.info('Single-machine training.')
     local_job_device = ''
     shared_job_device = ''
     is_actor_fn = lambda i: True
@@ -468,6 +440,7 @@ def train(action_set, level_names):
     server = tf.train.Server.create_local_server()
     filters = []
   else:
+    tf.logging.info('Multi-machine training.')
     local_job_device = '/job:%s/task:%d' % (FLAGS.job_name, FLAGS.task)
     shared_job_device = '/job:learner/task:0'
     is_actor_fn = lambda i: FLAGS.job_name == 'actor' and i == FLAGS.task
@@ -582,7 +555,7 @@ def train(action_set, level_names):
         checkpoint_dir=FLAGS.logdir,
         save_checkpoint_secs=600,
         save_summaries_secs=30,
-        log_step_count_steps=50000,
+        log_step_count_steps=1000,
         config=config,
         hooks=[py_process.PyProcessHook()]) as session:
 
@@ -590,6 +563,11 @@ def train(action_set, level_names):
         # Logging.
         level_returns = {level_name: [] for level_name in level_names}
         summary_writer = tf.summary.FileWriterCache.get(FLAGS.logdir)
+
+        tf.logging.info('Starting run for invocation \'%s\' on %s',
+                        ' '.join(sys.argv),
+                        time.strftime('%Y/%m/%d-%H:%M:%S'))
+        tf.logging.info('Flag settings: %s', FLAGS.flag_values_dict())
 
         # Prepare data for first run.
         session.run_step_fn(
@@ -606,6 +584,7 @@ def train(action_set, level_names):
               level_names_v[done_v],
               infos_v.episode_return[done_v],
               infos_v.episode_step[done_v]):
+            level_name = level_name.decode()
             episode_frames = episode_step * FLAGS.num_action_repeats
 
             tf.logging.info('Level: %s Episode return: %f',
@@ -682,7 +661,8 @@ def test(action_set, level_names):
 def main(_):
   tf.logging.set_verbosity(tf.logging.INFO)
 
-  action_set = environments.DEFAULT_ACTION_SET
+  action_set = tuple((a,) for a in range(FLAGS.num_actions))
+
   if FLAGS.level_name == 'dmlab30' and FLAGS.mode == 'train':
     level_names = dmlab30.LEVEL_MAPPING.keys()
   elif FLAGS.level_name == 'dmlab30' and FLAGS.mode == 'test':

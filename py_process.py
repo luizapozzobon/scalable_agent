@@ -139,7 +139,7 @@ class _TFProxy(object):
           in_.close()
           return
 
-        method_name = str(serialized[0])
+        method_name = serialized[0].decode()
         inputs = serialized[1:]
 
         # Compute result.
