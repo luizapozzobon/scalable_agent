@@ -25,7 +25,9 @@ RUN apt-get update && apt-get install -y \
     git \
     python-setuptools \
     python-pip \
-    libjpeg-dev
+    libjpeg-dev \
+    python3-pip \
+    python3
 
 # Install bazel
 RUN echo "deb [arch=amd64] http://storage.googleapis.com/bazel-apt stable jdk1.8" | \
@@ -34,25 +36,27 @@ RUN echo "deb [arch=amd64] http://storage.googleapis.com/bazel-apt stable jdk1.8
     apt-key add - && \
     apt-get update && apt-get install -y bazel
 
+RUN pip3 install --upgrade pip
+
 # Install TensorFlow and other dependencies
-RUN pip install tensorflow==1.9.0 dm-sonnet==1.23 gym[atari] opencv-python
+RUN pip3 install tensorflow==1.9.0 dm-sonnet==1.23 gym[atari]==0.15.7 opencv-python
 
 # Clone.
 WORKDIR scalable_agent
 COPY *.py *.cc ./
 
 # Build dynamic batching module.
-RUN TF_INC="$(python -c 'import tensorflow as tf; print(tf.sysconfig.get_include())')" && \
-    TF_LIB="$(python -c 'import tensorflow as tf; print(tf.sysconfig.get_lib())')" && \
+RUN TF_INC="$(python3 -c 'import tensorflow as tf; print(tf.sysconfig.get_include())')" && \
+    TF_LIB="$(python3 -c 'import tensorflow as tf; print(tf.sysconfig.get_lib())')" && \
     g++-4.8 -std=c++11 -shared batcher.cc -o batcher.so -fPIC -I $TF_INC -O2 -D_GLIBCXX_USE_CXX11_ABI=0 -L$TF_LIB -ltensorflow_framework
 
 # Run tests.
-#RUN python py_process_test.py
-#RUN python dynamic_batching_test.py
-#RUN python vtrace_test.py
+#RUN python3 py_process_test.py
+#RUN python3 dynamic_batching_test.py
+#RUN python3 vtrace_test.py
 
 # Run.
-CMD ["sh", "-c", "python experiment.py --total_environment_frames=10000 && python experiment.py --mode=test --test_num_episodes=5"]
+CMD ["sh", "-c", "python3 experiment.py --total_environment_frames=10000 && python experiment.py --mode=test --test_num_episodes=5"]
 
 # Docker commands:
 #   docker rm scalable_agent -v

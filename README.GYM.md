@@ -16,7 +16,7 @@ $ pip install tensorflow-gpu==1.9.0 dm-sonnet==1.23 gym[atari] opencv-python
 Example command:
 
 ```shell
-rm -rf /tmp/agent && python experiment.py --total_environment_frames=200000000 --batch_size 32 --num_actors 48 --level_name BowlingNoFrameskip-v4 --unroll_length 20
+rm -rf /tmp/agent && python3 experiment.py --total_environment_frames=200000000 --batch_size 32 --num_actors 48 --level_name BowlingNoFrameskip-v4 --unroll_length 20
 ```
 
 Weight checkpoints and Tensorboard data is saved into `/tmp/agent` by
