@@ -33,7 +33,6 @@ import dmlab30
 import environments
 import py_process
 import vtrace
-import wandb
 
 try:
     import dynamic_batching

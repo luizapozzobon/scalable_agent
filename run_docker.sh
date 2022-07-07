@@ -1,2 +1,1 @@
-
-docker run -it --rm -v /home/luiza/Documents/estudos/mestrado/pesquisas/gym-wrapper/atari-env-seed-wrapper/:/home/atari-env-seed-wrapper --name luizapozzobon_impala_2 luizapozzobon/impala:latest /bin/bash
+nvidia-docker run -ti --userns=host --shm-size 64G -p 6006:6006 -v /home/luiza.pozzobon/repos/submodule/atari-env-seed-wrapper/:/home/atari-env-seed-wrapper --name luizapozzobon_impala luizapozzobon/impala:latest /bin/bash
